@@ -5,7 +5,7 @@ so anyone behind you leaks through. Here YOLO-seg splits people into instances, 
 keeps their IDs and we lock onto one ID (the largest person at start, or after 'r').
 Robust Video Matting gives the clean hair/edge alpha; it is multiplied by the (slightly
 dilated, feathered) mask of the locked person minus everyone else's masks, and by a
-head-and-shoulders cut line, so other people, the chair and waving arms stay out.
+cut line just below the shoulders (YOLO-pose), so other people, the chair and arms stay out.
 Output goes to the OBS Virtual Camera (do not start OBS's own virtual camera meanwhile).
 
   python solocam.py                        # webcam "Full HD webcam" -> OBS Virtual Camera, plain dark bg
@@ -37,7 +37,9 @@ ap.add_argument("--bg", default="#232a33", help="#rrggbb solid colour | blur | p
 ap.add_argument("--model", default="yolo11s-seg.pt")
 ap.add_argument("--imgsz", type=int, default=640, help="YOLO input size")
 ap.add_argument("--grow", type=int, default=9, help="px the person mask is dilated before gating RVM alpha (small: chair/arm ghosts stay out)")
-ap.add_argument("--cut", type=float, default=0.65, help="fraction of the frame height below which everything is background (head+shoulders only); 1 = off")
+ap.add_argument("--cut", type=float, default=0.65, help="fallback cut line as a fraction of the frame height when shoulders are not seen; 1 = no cut at all")
+ap.add_argument("--below", type=float, default=0.8, help="cut line below the shoulders, in nose-to-shoulder distances")
+ap.add_argument("--pose", default="yolo11n-pose.pt", help="pose model that finds the shoulders")
 ap.add_argument("--feather", type=int, default=21, help="px of soft falloff at the mask edge")
 ap.add_argument("--hold", type=float, default=1.5, help="s to keep the last mask when the target is lost")
 ap.add_argument("--preview", action="store_true")
@@ -136,9 +138,9 @@ class Detector:
 
     def __init__(self):
         self.yolo = YOLO(a.model)
-        # ponytail: fixed cut line at a fraction of the frame; pose keypoints (shoulders) if the user moves around
-        y = torch.arange(H, device=dev).float()
-        self.cut = ((a.cut * H + 30 - y) / 60).clamp(0, 1).view(1, 1, H, 1)  # 1 above the line, 60 px fade
+        self.pose = YOLO(a.pose) if a.cut < 1 else None  # shoulders -> cut line
+        self.line = a.cut * H  # cut line in px, smoothed
+        self.rows = torch.arange(H, device=dev).float().view(1, 1, H, 1)
         self.grow_k, self.feather_k = a.grow | 1, a.feather | 1
         self.stream = torch.cuda.Stream()
         self.rgb, self.gate, self.target_id, self.relock, self.box = None, None, None, False, None
@@ -154,6 +156,21 @@ class Detector:
         m = m.float()[None, None]
         return m if m.shape[-2:] == (H, W) else F.interpolate(m, size=(H, W), mode="bilinear", align_corners=False)
 
+    def shoulder_line(self, bgr, box):
+        """Cut line in px: shoulders + a.below * (nose-to-shoulder); a.cut * H when the pose is not seen."""
+        r = self.pose.predict(bgr, imgsz=a.imgsz, classes=[0], conf=0.35, verbose=False, device=0)[0]
+        if r.keypoints is None or not len(r.boxes):
+            return a.cut * H
+        pb = r.boxes.xyxy.cpu().numpy()
+        j = int(np.argmax([iou(b, box) for b in pb]))
+        if iou(pb[j], box) < 0.5:
+            return a.cut * H
+        xy, c = r.keypoints.xy[j].cpu().numpy(), r.keypoints.conf[j].cpu().numpy()
+        if min(c[0], c[5], c[6]) < 0.5:  # nose, left/right shoulder
+            return a.cut * H
+        sh = (xy[5, 1] + xy[6, 1]) / 2
+        return float(sh + a.below * (sh - xy[0, 1]))
+
     def _run(self):
         target_id, last_box, last_seen = None, None, 0.0
         while True:
@@ -163,7 +180,8 @@ class Detector:
             if self.relock:
                 target_id, last_box, self.relock = None, None, False
             with torch.inference_mode(), torch.cuda.stream(self.stream):
-                r = self.yolo.track(np.ascontiguousarray(rgb[..., ::-1]), persist=True, classes=[0], conf=0.35,
+                bgr = np.ascontiguousarray(rgb[..., ::-1])
+                r = self.yolo.track(bgr, persist=True, classes=[0], conf=0.35,
                                     imgsz=a.imgsz, retina_masks=True, verbose=False, device=0,
                                     tracker="bytetrack.yaml")[0]
                 now, idx = time.time(), None
@@ -178,7 +196,9 @@ class Detector:
                     gate = F.max_pool2d(m, self.grow_k, 1, self.grow_k // 2)  # small dilation: hair only
                     for _ in range(2):  # soft edge, so the gate does not add its own hard outline
                         gate = F.avg_pool2d(gate, self.feather_k, 1, self.feather_k // 2, count_include_pad=False)
-                    gate = gate * self.cut
+                    if self.pose is not None:
+                        self.line += 0.3 * (self.shoulder_line(bgr, boxes[idx]) - self.line)
+                        gate = gate * ((self.line + 30 - self.rows) / 60).clamp(0, 1)  # 1 above, 60 px fade
                     others = [k for k in range(len(boxes)) if k != idx]
                     if others:  # cut other people out of the rim too
                         gate = gate * (1 - self._up(r.masks.data[others].amax(0)) * (1 - m))
