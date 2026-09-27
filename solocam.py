@@ -26,7 +26,14 @@ import torch
 import torch.nn.functional as F
 from ultralytics import YOLO
 
-FFMPEG = os.environ.get("SOLOCAM_FFMPEG", "ffmpeg")
+import glob
+import shutil
+
+if sys.stdout is None:  # pythonw (autostart task): keep a log instead of a console
+    sys.stdout = sys.stderr = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "solocam.log"), "a", buffering=1)
+
+FFMPEG = os.environ.get("SOLOCAM_FFMPEG") or shutil.which("ffmpeg") or next(iter(glob.glob(
+    os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\Gyan.FFmpeg_*\ffmpeg-*\bin\ffmpeg.exe"))), "ffmpeg")
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--cam", default="Full HD webcam", help="DirectShow camera name")

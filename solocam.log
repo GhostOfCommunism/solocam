@@ -1,0 +1,19 @@
+usage: solocam.py [-h] [--cam CAM] [--src SRC] [--size SIZE] [--fps FPS]
+                  [--bg BG] [--model MODEL] [--imgsz IMGSZ] [--grow GROW]
+                  [--cut CUT] [--below BELOW] [--pose POSE]
+                  [--feather FEATHER] [--hold HOLD] [--preview] [--no-vcam]
+                  [--out OUT] [--frames FRAMES]
+solocam.py: error: unrecognized arguments: install
+virtual camera: OBS Virtual Camera
+23.0 fps, target id 1
+25.9 fps, target id 1
+27.2 fps, target id 1
+27.8 fps, target id 1
+28.2 fps, target id 1
+28.5 fps, target id 1
+28.7 fps, target id 1
+28.9 fps, target id 1
+29.0 fps, target id 1
+29.1 fps, target id 1
+29.1 fps, target id 1
+29.2 fps, target id 1
