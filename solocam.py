@@ -6,20 +6,23 @@ keeps their IDs and we lock onto one ID (the largest person at start, or after '
 Robust Video Matting gives the clean hair/edge alpha; it is multiplied by the (slightly
 dilated, feathered) mask of the locked person minus everyone else's masks, and by a
 cut line just below the shoulders (YOLO-pose), so other people, the chair and arms stay out.
-Output goes to the OBS Virtual Camera (do not start OBS's own virtual camera meanwhile).
+Output goes to the Windows 11 virtual camera "solocam" (vcam.py); the webcam and the nets
+run only while some app streams from it.
 
-  python solocam.py                        # webcam "Full HD webcam" -> OBS Virtual Camera, plain dark bg
+  python solocam.py                        # webcam "Full HD webcam" -> camera "solocam", plain dark bg
   python solocam.py --bg blur              # blurred real background instead
   python solocam.py --bg C:\\pics\\room.jpg  # replace background with a picture (or --bg green)
   python solocam.py --preview              # also show a window; keys (window focused): r = re-lock on largest, q/Esc or close button = quit
   python solocam.py --src clip.mp4 --out o.mp4 --no-vcam   # offline test on a file
 """
 import argparse
+import gc
 import os
 import subprocess
 import sys
 import threading
 import time
+import types
 
 import numpy as np
 import torch
@@ -53,9 +56,15 @@ ap.add_argument("--preview", action="store_true")
 ap.add_argument("--no-vcam", action="store_true")
 ap.add_argument("--out", help="also write the result to this video file")
 ap.add_argument("--frames", type=int, default=0, help="stop after N frames (tests)")
+ap.add_argument("--ui", type=int, default=8765, help="settings page port on 127.0.0.1, 0 = off")
 a = ap.parse_args()
+if not a.no_vcam:  # settings saved from the settings page win over the defaults above
+    import ui
+    ui.load(a)
 W, H = map(int, a.size.split("x"))
 dev = torch.device("cuda")
+# shared with the settings page (ui.py)
+state = types.SimpleNamespace(status="idle", fps=0.0, det=None, frame=None, viewers=0)
 
 
 class Grabber:
@@ -127,8 +136,11 @@ def make_bg():
         return torch.tensor(rgb, device=dev).view(1, 3, 1, 1).expand(1, 3, H, W)
     if a.bg != "blur":
         import cv2
-        img = cv2.cvtColor(cv2.imread(a.bg), cv2.COLOR_BGR2RGB)
-        img = cv2.resize(img, (W, H), interpolation=cv2.INTER_AREA)
+        img = cv2.imread(a.bg)
+        if img is None:  # missing/unreadable picture: plain dark instead of a crash
+            print("cannot read background", a.bg)
+            return torch.tensor([0.14, 0.16, 0.2], device=dev).view(1, 3, 1, 1).expand(1, 3, H, W)
+        img = cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), (W, H), interpolation=cv2.INTER_AREA)
         return torch.from_numpy(img).to(dev).permute(2, 0, 1)[None].float() / 255
     return None
 
@@ -145,14 +157,21 @@ class Detector:
 
     def __init__(self):
         self.yolo = YOLO(a.model)
-        self.pose = YOLO(a.pose) if a.cut < 1 else None  # shoulders -> cut line
+        self.pose = YOLO(a.pose)  # shoulders -> cut line (used while a.cut < 1)
         self.line = a.cut * H  # cut line in px, smoothed
         self.rows = torch.arange(H, device=dev).float().view(1, 1, H, 1)
-        self.grow_k, self.feather_k = a.grow | 1, a.feather | 1
         self.stream = torch.cuda.Stream()
         self.rgb, self.gate, self.target_id, self.relock, self.box = None, None, None, False, None
+        self.stop = False
         self.cv = threading.Condition()
-        threading.Thread(target=self._run, daemon=True).start()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        with self.cv:
+            self.stop = True
+            self.cv.notify()
+        self.thread.join()
 
     def push(self, rgb):
         with self.cv:
@@ -182,7 +201,9 @@ class Detector:
         target_id, last_box, last_seen = None, None, 0.0
         while True:
             with self.cv:
-                self.cv.wait_for(lambda: self.rgb is not None)
+                self.cv.wait_for(lambda: self.rgb is not None or self.stop)
+                if self.stop:
+                    return
                 rgb, self.rgb = self.rgb, None
             if self.relock:
                 target_id, last_box, self.relock = None, None, False
@@ -200,10 +221,11 @@ class Detector:
                     target_id = int(ids[idx]) if ids is not None else target_id
                     last_box, last_seen = boxes[idx], now
                     m = self._up(r.masks.data[idx])
-                    gate = F.max_pool2d(m, self.grow_k, 1, self.grow_k // 2)  # small dilation: hair only
+                    gk, fk = int(a.grow) | 1, int(a.feather) | 1  # read live: the settings page changes them
+                    gate = F.max_pool2d(m, gk, 1, gk // 2)  # small dilation: hair only
                     for _ in range(2):  # soft edge, so the gate does not add its own hard outline
-                        gate = F.avg_pool2d(gate, self.feather_k, 1, self.feather_k // 2, count_include_pad=False)
-                    if self.pose is not None:
+                        gate = F.avg_pool2d(gate, fk, 1, fk // 2, count_include_pad=False)
+                    if a.cut < 1:
                         self.line += 0.3 * (self.shoulder_line(bgr, boxes[idx]) - self.line)
                         gate = gate * ((self.line + 30 - self.rows) / 60).clamp(0, 1)  # 1 above, 60 px fade
                     others = [k for k in range(len(boxes)) if k != idx]
@@ -250,15 +272,14 @@ class Matter:
 
 
 def main():
-    det = Detector()
-    matte = Matter()
-    bg_static = make_bg()
-
     cam = None
     if not a.no_vcam:
-        import pyvirtualcam
-        cam = pyvirtualcam.Camera(W, H, a.fps, backend="obs", fmt=pyvirtualcam.PixelFormat.RGB)
-        print("virtual camera:", cam.device)
+        import vcam
+        cam = vcam.VirtualCamera(W, H, a.fps)
+        print("virtual camera: solocam")
+        if a.ui:
+            import ui
+            ui.start(a, state, a.ui)
     writer = None
     if a.out:
         writer = subprocess.Popen([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo",
@@ -267,51 +288,98 @@ def main():
     if a.preview:
         import cv2
 
-    grab = Grabber()
-    seq, n, t0 = 0, 0, time.time()
-    while True:
-        buf, seq = grab.get(seq)
-        if buf is None:
-            print("source ended")
-            break
-        rgb = np.frombuffer(buf, np.uint8).reshape(H, W, 3).copy()  # writable: torch warns otherwise
-        det.push(rgb)
-        with torch.inference_mode():
-            src = torch.from_numpy(rgb).to(dev).permute(2, 0, 1)[None].float() / 255
-            pha = matte(src)
-            gate = det.gate
-            alpha = pha * gate if gate is not None else torch.zeros_like(pha)
-            bg = bg_static if bg_static is not None else blur(src)
-            out = src * alpha + bg * (1 - alpha)
-            frame = (out[0].permute(1, 2, 0) * 255).clamp(0, 255).byte().cpu().numpy()
+    # With the virtual camera the webcam is open and the nets are in VRAM only while some app
+    # streams from "solocam" (Windows reports it, see vcam.Monitor) or the settings page shows
+    # its preview. --preview and tests run all the time.
+    watched = lambda: a.preview or not cam or cam.active.is_set() or state.viewers > 0
+    alpha_ch = torch.ones(1, 1, H, W, device=dev)
+    n, t0, backoff, quit_ = 0, time.time(), 1, False
+    while not quit_:
+        if not watched():
+            state.status = "idle"
+            print("idle", time.strftime("%X"))
+            while not watched():
+                time.sleep(0.25)  # two in-process flags; the waits for Windows are in vcam.Monitor
+            print("watched", time.strftime("%X"))
+        state.status = "starting"
+        grab = Grabber()  # the webcam opens while the nets load
+        det, matte = Detector(), Matter()
+        state.det, bg_key, bg_static = det, None, None
+        state.status = "active"
+        n, t0, seq, idle_since, ended = 0, time.time(), 0, None, False
+        bg = src = pha = gate = alpha = out = None
+        while True:
+            buf, seq = grab.get(seq)
+            if buf is None:
+                ended = True
+                break
+            if watched():
+                idle_since = None
+            elif time.time() - (idle_since := idle_since or time.time()) > 5:
+                break  # nobody watched for 5 s (grace for apps that reopen the camera)
+            if a.bg != bg_key:  # changed on the settings page
+                bg_static = make_bg()
+                bg_key = a.bg
+            rgb = np.frombuffer(buf, np.uint8).reshape(H, W, 3).copy()  # writable: torch warns otherwise
+            det.push(rgb)
+            with torch.inference_mode():
+                src = torch.from_numpy(rgb).to(dev).permute(2, 0, 1)[None].float() / 255
+                pha = matte(src)
+                gate = det.gate
+                alpha = pha * gate if gate is not None else torch.zeros_like(pha)
+                bg = bg_static if bg_static is not None else blur(src)
+                out = src * alpha + bg * (1 - alpha)
+                if cam:
+                    bgra = torch.cat([out[:, [2, 1, 0]], alpha_ch], 1)
+                    bgra = (bgra[0].permute(1, 2, 0) * 255).clamp(0, 255).byte().contiguous().cpu().numpy()
+                    cam.send(bgra)
+                    if state.viewers:
+                        state.frame = bgra
+                frame = (out[0].permute(1, 2, 0) * 255).clamp(0, 255).byte().cpu().numpy() if writer or a.preview else None
 
-        if cam:
-            cam.send(frame)
-        if writer:
-            writer.stdin.write(frame.tobytes())
-        if a.preview:
-            view = np.ascontiguousarray(frame[..., ::-1])
-            b = det.box
-            if b is not None:  # preview only: who is locked
-                cv2.rectangle(view, (int(b[0]), int(b[1])), (int(b[2]), int(b[3])), (0, 255, 0), 2)
-                cv2.putText(view, f"id {det.target_id}", (int(b[0]), int(b[1]) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.imshow("solocam", view)
-            k = cv2.waitKey(1) & 0xFF
-            if k in (ord("q"), 27) or cv2.getWindowProperty("solocam", cv2.WND_PROP_VISIBLE) < 1:
-                break  # q / Esc with the window focused, or its close button
-            if k == ord("r"):
-                det.relock = True
-        n += 1
-        if n % 150 == 0:
-            print(f"{n / (time.time() - t0):.1f} fps, target id {det.target_id}")
-        if a.frames and n >= a.frames:
-            break
+            if writer:
+                writer.stdin.write(frame.tobytes())
+            if a.preview:
+                view = np.ascontiguousarray(frame[..., ::-1])
+                b = det.box
+                if b is not None:  # preview only: who is locked
+                    cv2.rectangle(view, (int(b[0]), int(b[1])), (int(b[2]), int(b[3])), (0, 255, 0), 2)
+                    cv2.putText(view, f"id {det.target_id}", (int(b[0]), int(b[1]) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.imshow("solocam", view)
+                k = cv2.waitKey(1) & 0xFF
+                if k in (ord("q"), 27) or cv2.getWindowProperty("solocam", cv2.WND_PROP_VISIBLE) < 1:
+                    quit_ = True  # q / Esc with the window focused, or its close button
+                    break
+                if k == ord("r"):
+                    det.relock = True
+            n += 1
+            backoff = 1
+            if n % 150 == 0:
+                state.fps = round(n / (time.time() - t0), 1)
+                print(f"{state.fps} fps, target id {det.target_id}")
+            if a.frames and n >= a.frames:
+                quit_ = True
+                break
+        grab.p.kill()
+        # give the VRAM back while idle (the CUDA context itself stays, ~0.3 GB)
+        det.close()
+        state.det = state.frame = None
+        del det, matte, bg_static, bg, src, pha, gate, alpha, out
+        gc.collect()
+        torch.cuda.empty_cache()
+        if ended:
+            if not cam:
+                print("source ended")
+                break
+            # webcam dropped out (USB hiccup, sleep): reopen, backing off up to 30 s
+            print(f"source ended, reopening in {backoff} s")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)
 
-    print(f"done: {n} frames, {n / (time.time() - t0):.1f} fps")
+    print(f"done: {n} frames, {n / max(time.time() - t0, 1e-6):.1f} fps")
     if writer:
         writer.stdin.close()
         writer.wait()
-    grab.p.kill()
 
 
 if __name__ == "__main__":

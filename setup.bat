@@ -7,3 +7,5 @@ py -3.12 -m venv .venv 2>nul || python -m venv .venv || exit /b 1
 .venv\Scripts\python.exe -m pip install -r requirements.txt || exit /b 1
 where ffmpeg >nul 2>nul || winget install -e --id Gyan.FFmpeg --accept-package-agreements --accept-source-agreements
 .venv\Scripts\python.exe -c "import torch; print('CUDA:', torch.cuda.is_available())"
+rem Virtual camera "solocam": register its media source DLL once (UAC prompt)
+reg query "HKLM\SOFTWARE\Classes\CLSID\{3522155e-17e0-4fd6-bf40-98a9dc8e53d1}" >nul 2>nul || powershell -NoProfile -Command "Start-Process cmd -ArgumentList '/c','%~dp0vcam\register.cmd' -Verb RunAs -Wait"

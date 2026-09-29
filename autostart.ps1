@@ -1,4 +1,4 @@
-# Keep solocam running in the background, so "OBS Virtual Camera" is always live.
+# Keep solocam running in the background, so the "solocam" camera is always in the system.
 # A shortcut in the user's Startup folder (no admin needed) starts it at logon via pythonw (no console).
 #   autostart.bat install [solocam args]   create the shortcut and start now (args are baked in)
 #   autostart.bat remove                   stop and delete the shortcut

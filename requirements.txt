@@ -1,3 +1,2 @@
 ultralytics>=8.4
-pyvirtualcam>=0.15
 opencv-python
