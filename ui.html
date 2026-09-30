@@ -57,6 +57,9 @@
   .drop.over { border-color: var(--accent); color: var(--accent); }
   .err { color: #d64545; font-size: 13px; min-height: 18px; margin-top: 8px; }
   .hidden { display: none; }
+  .check { display: block; margin: 10px 0 0; cursor: pointer; }
+  .check input { accent-color: var(--accent); margin-right: 6px; }
+  .check small { display: block; color: var(--muted); font-size: 12.5px; margin: 2px 0 0 24px; }
 </style>
 </head>
 <body>
@@ -79,7 +82,7 @@
     <div class="card">
       <h2>Фон</h2>
       <div class="seg" id="mode">
-        <button data-m="color">Цвет</button><button data-m="blur">Размытие</button><button data-m="image">Картинка</button>
+        <button data-m="color">Цвет</button><button data-m="image">Картинка</button>
       </div>
       <div id="colorBox" class="field row">
         <input type="color" id="color"> <span class="status">сплошной цвет</span>
@@ -88,6 +91,16 @@
         <div class="drop" id="drop">Перетащите картинку сюда или нажмите, чтобы выбрать</div>
         <input type="file" id="file" accept="image/*" class="hidden">
         <div class="gallery" id="gallery"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Кадрирование</h2>
+      <label class="check"><input type="checkbox" id="crop_cut"> Кадр по линии отсечки <small>низ кадра — по линии отсечки торса, без пустой полосы снизу</small></label>
+      <label class="check"><input type="checkbox" id="crop_body"> Кадр вокруг фигуры <small>приближать и вести камеру за вами</small></label>
+      <div class="field">
+        <label>Поля вокруг фигуры <span id="crop_pad_v"></span></label>
+        <input type="range" id="crop_pad" min="0" max="0.6" step="0.05">
       </div>
     </div>
 
@@ -123,8 +136,9 @@
 
 <script>
 const $ = id => document.getElementById(id);
-const DEFAULTS = { bg: "#232a33", below: 0.8, cut: 0.65, grow: 9, feather: 21, hold: 1.5 };
-const SLIDERS = ["below", "cut", "grow", "feather", "hold"];
+const DEFAULTS = { bg: "#232a33", below: 0.8, cut: 0.65, grow: 9, feather: 21, hold: 1.5, crop_pad: 0.15 };
+const SLIDERS = ["below", "cut", "grow", "feather", "hold", "crop_pad"];
+const CHECKS = ["crop_cut", "crop_body"];
 let st = null, mode = "color";
 
 function err(msg) { $("err").textContent = msg || ""; }
@@ -138,7 +152,7 @@ async function post(path, body, raw) {
   err(); return j;
 }
 
-const isImage = bg => bg !== "blur" && !bg.startsWith("#");
+const isImage = bg => !bg.startsWith("#");
 const baseName = p => p.split(/[\\/]/).pop();
 
 function render() {
@@ -148,6 +162,7 @@ function render() {
     $(k + "_v").textContent = s[k];
   }
   if (s.bg.startsWith("#")) $("color").value = s.bg;
+  for (const k of CHECKS) $(k).checked = s[k];
   document.querySelectorAll("#mode button").forEach(b => b.classList.toggle("on", b.dataset.m === mode));
   $("colorBox").classList.toggle("hidden", mode !== "color");
   $("imageBox").classList.toggle("hidden", mode !== "image");
@@ -169,7 +184,7 @@ function render() {
 async function refresh(first) {
   try {
     st = await (await fetch("/state")).json();
-    if (first) mode = st.settings.bg === "blur" ? "blur" : isImage(st.settings.bg) ? "image" : "color";
+    if (first) mode = isImage(st.settings.bg) ? "image" : "color";
     render();
   } catch { $("status").innerHTML = '<span class="dot"></span><b>solocam не запущен</b>'; }
 }
@@ -185,8 +200,7 @@ async function upload(file) {
 
 document.querySelectorAll("#mode button").forEach(b => b.onclick = () => {
   mode = b.dataset.m;
-  if (mode === "blur") set({ bg: "blur" });
-  else if (mode === "color") set({ bg: $("color").value });
+  if (mode === "color") set({ bg: $("color").value });
   else if (st.backgrounds.length) pick(st.backgrounds[st.backgrounds.length - 1]);
   render();
 });
@@ -195,6 +209,7 @@ for (const k of SLIDERS) {
   $(k).oninput = e => { $(k + "_v").textContent = e.target.value; };
   $(k).onchange = e => set({ [k]: Number(e.target.value) });
 }
+for (const k of CHECKS) $(k).onchange = e => set({ [k]: e.target.checked });
 $("reset").onclick = () => set(Object.fromEntries(SLIDERS.map(k => [k, DEFAULTS[k]])));
 $("relock").onclick = () => post("/relock", {}).catch(() => {});
 

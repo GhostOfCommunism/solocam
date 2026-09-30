@@ -10,7 +10,6 @@ Output goes to the Windows 11 virtual camera "solocam" (vcam.py); the webcam and
 run only while some app streams from it.
 
   python solocam.py                        # webcam "Full HD webcam" -> camera "solocam", plain dark bg
-  python solocam.py --bg blur              # blurred real background instead
   python solocam.py --bg C:\\pics\\room.jpg  # replace background with a picture (or --bg green)
   python solocam.py --preview              # also show a window; keys (window focused): r = re-lock on largest, q/Esc or close button = quit
   python solocam.py --src clip.mp4 --out o.mp4 --no-vcam   # offline test on a file
@@ -43,7 +42,7 @@ ap.add_argument("--cam", default="Full HD webcam", help="DirectShow camera name"
 ap.add_argument("--src", help="video file instead of the camera (looped)")
 ap.add_argument("--size", default="1280x720")
 ap.add_argument("--fps", type=int, default=30)
-ap.add_argument("--bg", default="#232a33", help="#rrggbb solid colour | blur | path to an image (jpg/png)")
+ap.add_argument("--bg", default="#232a33", help="#rrggbb solid colour | path to an image (jpg/png)")
 ap.add_argument("--model", default="yolo11s-seg.pt")
 ap.add_argument("--imgsz", type=int, default=640, help="YOLO input size")
 ap.add_argument("--grow", type=int, default=9, help="px the person mask is dilated before gating RVM alpha (small: chair/arm ghosts stay out)")
@@ -52,6 +51,9 @@ ap.add_argument("--below", type=float, default=0.8, help="cut line below the sho
 ap.add_argument("--pose", default="yolo11n-pose.pt", help="pose model that finds the shoulders")
 ap.add_argument("--feather", type=int, default=21, help="px of soft falloff at the mask edge")
 ap.add_argument("--hold", type=float, default=1.5, help="s to keep the last mask when the target is lost")
+ap.add_argument("--crop-cut", action="store_true", help="zoom so the frame ends at the cut line (no empty band below)")
+ap.add_argument("--crop-body", action="store_true", help="zoom to the locked person (auto-framing)")
+ap.add_argument("--crop-pad", type=float, default=0.15, help="room around the person when zoomed, fraction of their size")
 ap.add_argument("--preview", action="store_true")
 ap.add_argument("--no-vcam", action="store_true")
 ap.add_argument("--out", help="also write the result to this video file")
@@ -64,7 +66,8 @@ if not a.no_vcam:  # settings saved from the settings page win over the defaults
 W, H = map(int, a.size.split("x"))
 dev = torch.device("cuda")
 # shared with the settings page (ui.py)
-state = types.SimpleNamespace(status="idle", fps=0.0, det=None, frame=None, viewers=0)
+# preview_until: the settings page / tray panel keeps it in the future while it shows the preview
+state = types.SimpleNamespace(status="idle", fps=0.0, det=None, frame=None, preview_until=0.0)
 
 
 class Grabber:
@@ -78,7 +81,9 @@ class Grabber:
             inp = ["-f", "dshow", "-rtbufsize", "64M", "-i", f"video={a.cam}"]
         cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", *inp,
                "-vf", f"scale={W}:{H}", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
-        self.p = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=W * H * 3)
+        # no console window: under pythonw each ffmpeg start flashed one, stealing focus from the tray panel
+        self.p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, bufsize=W * H * 3,
+                                  creationflags=subprocess.CREATE_NO_WINDOW)
         self.frame, self.seq = None, 0
         self.cv = threading.Condition()
         threading.Thread(target=self._run, daemon=True).start()
@@ -134,20 +139,50 @@ def make_bg():
     if a.bg.startswith("#"):  # solid colour
         rgb = [int(a.bg[i:i + 2], 16) / 255 for i in (1, 3, 5)]
         return torch.tensor(rgb, device=dev).view(1, 3, 1, 1).expand(1, 3, H, W)
-    if a.bg != "blur":
-        import cv2
-        img = cv2.imread(a.bg)
-        if img is None:  # missing/unreadable picture: plain dark instead of a crash
-            print("cannot read background", a.bg)
-            return torch.tensor([0.14, 0.16, 0.2], device=dev).view(1, 3, 1, 1).expand(1, 3, H, W)
-        img = cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), (W, H), interpolation=cv2.INTER_AREA)
-        return torch.from_numpy(img).to(dev).permute(2, 0, 1)[None].float() / 255
-    return None
+    import cv2
+    img = cv2.imread(a.bg)
+    if img is None:  # missing/unreadable picture: plain dark instead of a crash
+        print("cannot read background", a.bg)
+        return torch.tensor([0.14, 0.16, 0.2], device=dev).view(1, 3, 1, 1).expand(1, 3, H, W)
+    img = cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), (W, H), interpolation=cv2.INTER_AREA)
+    return torch.from_numpy(img).to(dev).permute(2, 0, 1)[None].float() / 255
 
 
-def blur(x):  # cheap strong blur on GPU: shrink 16x and scale back
-    s = F.interpolate(x, scale_factor=1 / 16, mode="area")
-    return F.interpolate(s, size=x.shape[-2:], mode="bilinear", align_corners=False)
+class Framer:
+    """Digital zoom of the output: bottom edge on the cut line and/or a box around the person.
+    Eased towards its target every frame, so the frame glides instead of jumping."""
+
+    def __init__(self):
+        self.rect = [0.0, 0.0, float(W), float(H)]  # x0, y0, w, h
+
+    def target(self, box, line):
+        if box is None or not (a.crop_cut or a.crop_body):
+            return [0.0, 0.0, float(W), float(H)]
+        x0, y0, x1, y1 = box
+        pad = a.crop_pad
+        cut_y = line + 20 if a.cut < 1 else H  # below it everything is background anyway
+        if a.crop_cut:
+            bottom = min(cut_y, H)
+        else:  # crop_body: the visible figure ends at the cut line or at its box
+            bottom = min(y1 + pad * (y1 - y0), cut_y, H)
+        if a.crop_body:  # head room above, room at the sides, whichever needs more height
+            h = max((bottom - y0) * (1 + pad), (x1 - x0) * (1 + 2 * pad) * H / W)
+        else:
+            h = bottom
+        if a.crop_cut:
+            h = min(h, bottom)  # the frame must end at the cut line, even if a spread arm gets clipped
+        h = min(max(h, H / 3), H)  # ponytail: at most 3x zoom of the 1280x720 stream; crop the 1080p source if it gets soft
+        w = h * W / H
+        cx = (x0 + x1) / 2
+        return [min(max(cx - w / 2, 0), W - w), min(max(bottom - h, 0), H - h), w, h]
+
+    def __call__(self, img, box, line):
+        t = self.target(box, line)
+        self.rect = [r + 0.08 * (v - r) for r, v in zip(self.rect, t)]
+        x, y, w, h = (int(round(v)) for v in self.rect)
+        if w >= W - 1:
+            return img
+        return F.interpolate(img[..., y:y + h, x:x + w], size=(H, W), mode="bilinear", align_corners=False)
 
 
 class Detector:
@@ -291,7 +326,19 @@ def main():
     # With the virtual camera the webcam is open and the nets are in VRAM only while some app
     # streams from "solocam" (Windows reports it, see vcam.Monitor) or the settings page shows
     # its preview. --preview and tests run all the time.
-    watched = lambda: a.preview or not cam or cam.active.is_set() or state.viewers > 0
+    watched = lambda: a.preview or not cam or cam.active.is_set() or time.time() < state.preview_until
+    if cam and not watched():
+        # warm up once: the first model load in a process (CUDA/cuDNN init, kernels, file cache)
+        # takes ~10 s, later ones ~3 s; pay it at startup, not on the first call
+        det, matte = Detector(), Matter()
+        det.push(np.zeros((H, W, 3), np.uint8))
+        with torch.inference_mode():
+            matte(torch.zeros(1, 3, H, W, device=dev))
+        time.sleep(1)
+        det.close()
+        del det, matte
+        gc.collect()
+        torch.cuda.empty_cache()
     alpha_ch = torch.ones(1, 1, H, W, device=dev)
     n, t0, backoff, quit_ = 0, time.time(), 1, False
     while not quit_:
@@ -304,7 +351,7 @@ def main():
         state.status = "starting"
         grab = Grabber()  # the webcam opens while the nets load
         det, matte = Detector(), Matter()
-        state.det, bg_key, bg_static = det, None, None
+        state.det, bg_key, bg_static, framer = det, None, None, Framer()
         state.status = "active"
         n, t0, seq, idle_since, ended = 0, time.time(), 0, None, False
         bg = src = pha = gate = alpha = out = None
@@ -327,13 +374,13 @@ def main():
                 pha = matte(src)
                 gate = det.gate
                 alpha = pha * gate if gate is not None else torch.zeros_like(pha)
-                bg = bg_static if bg_static is not None else blur(src)
-                out = src * alpha + bg * (1 - alpha)
+                bg = bg_static
+                out = framer(src * alpha + bg * (1 - alpha), det.box, det.line)
                 if cam:
                     bgra = torch.cat([out[:, [2, 1, 0]], alpha_ch], 1)
                     bgra = (bgra[0].permute(1, 2, 0) * 255).clamp(0, 255).byte().contiguous().cpu().numpy()
                     cam.send(bgra)
-                    if state.viewers:
+                    if time.time() < state.preview_until:
                         state.frame = bgra
                 frame = (out[0].permute(1, 2, 0) * 255).clamp(0, 255).byte().cpu().numpy() if writer or a.preview else None
 

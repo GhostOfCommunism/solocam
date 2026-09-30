@@ -2,7 +2,8 @@
 
 Changes apply live (solocam reads `a.<name>` every frame) and are saved to settings.json,
 which overrides the command line defaults on the next start. Uploaded backgrounds go to bg/.
-While the page shows the preview it counts as a viewer, so the pipeline runs for it.
+While a preview is shown (/preview.mjpg here, /snapshot.jpg polled by the tray panel) it
+counts as a viewer, so the pipeline runs for it.
 """
 import json
 import os
@@ -19,7 +20,8 @@ SETTINGS = os.path.join(HERE, "settings.json")
 BG_DIR = os.path.join(HERE, "bg")
 # name -> (type, min, max); bg is checked separately
 LIVE = {"grow": (int, 1, 99), "feather": (int, 1, 99), "below": (float, 0, 3),
-        "cut": (float, 0.2, 1), "hold": (float, 0, 10)}
+        "cut": (float, 0.2, 1), "hold": (float, 0, 10),
+        "crop_cut": (bool, 0, 1), "crop_body": (bool, 0, 1), "crop_pad": (float, 0, 0.6)}
 
 
 def load(a):
@@ -39,11 +41,15 @@ def load(a):
 def apply(a, k, v):
     if k == "bg":
         v = str(v)
-        if not (v == "blur" or re.fullmatch(r"#[0-9a-fA-F]{6}", v) or os.path.isfile(v)):
+        if not (re.fullmatch(r"#[0-9a-fA-F]{6}", v) or os.path.isfile(v)):
             raise ValueError(f"bad bg {v!r}")
     elif k in LIVE:
         t, lo, hi = LIVE[k]
-        v = min(max(t(v), lo), hi)
+        if t is bool:
+            if not isinstance(v, bool):
+                raise ValueError(f"{k} must be true/false")
+        else:
+            v = min(max(t(v), lo), hi)
     else:
         raise ValueError(f"unknown setting {k!r}")
     setattr(a, k, v)
@@ -55,8 +61,6 @@ def save(a):
 
 
 def start(a, state, port):
-    lock = threading.Lock()
-
     class H(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
@@ -103,12 +107,19 @@ def start(a, state, port):
                     self.reply({"error": "no such file"}, code=404)
             elif path == "/preview.mjpg":
                 self.mjpeg()
+            elif path == "/snapshot.jpg":  # one frame; each call keeps the pipeline up for 3 s more
+                state.preview_until = time.time() + 3
+                f = state.frame
+                if f is None:
+                    self.send_response(204)
+                    self.end_headers()
+                else:
+                    ok, jpg = cv2.imencode(".jpg", np.ascontiguousarray(f[..., :3]), [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    self.reply(jpg.tobytes(), "image/jpeg")
             else:
                 self.reply({"error": "not found"}, code=404)
 
         def mjpeg(self):
-            with lock:
-                state.viewers += 1
             try:
                 self.send_response(200)
                 self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=f")
@@ -116,6 +127,7 @@ def start(a, state, port):
                 self.end_headers()
                 last = None
                 while True:
+                    state.preview_until = time.time() + 3
                     f = state.frame
                     if f is not None and f is not last:
                         last = f
@@ -125,11 +137,6 @@ def start(a, state, port):
                     time.sleep(1 / 15)
             except (ConnectionError, OSError):
                 pass  # page closed
-            finally:
-                with lock:
-                    state.viewers -= 1
-                    if not state.viewers:
-                        state.frame = None
 
         def do_POST(self):
             if self.foreign():
