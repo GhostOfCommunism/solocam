@@ -12,9 +12,6 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import cv2
-import numpy as np
-
 HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS = os.path.join(HERE, "settings.json")
 BG_DIR = os.path.join(HERE, "bg")
@@ -109,13 +106,12 @@ def start(a, state, port):
                 self.mjpeg()
             elif path == "/snapshot.jpg":  # one frame; each call keeps the pipeline up for 3 s more
                 state.preview_until = time.time() + 3
-                f = state.frame
-                if f is None:
+                jpg = state.jpg
+                if jpg is None:
                     self.send_response(204)
                     self.end_headers()
                 else:
-                    ok, jpg = cv2.imencode(".jpg", np.ascontiguousarray(f[..., :3]), [cv2.IMWRITE_JPEG_QUALITY, 80])
-                    self.reply(jpg.tobytes(), "image/jpeg")
+                    self.reply(jpg, "image/jpeg")
             else:
                 self.reply({"error": "not found"}, code=404)
 
@@ -128,12 +124,11 @@ def start(a, state, port):
                 last = None
                 while True:
                     state.preview_until = time.time() + 3
-                    f = state.frame
-                    if f is not None and f is not last:
-                        last = f
-                        ok, jpg = cv2.imencode(".jpg", np.ascontiguousarray(f[..., :3]), [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    jpg = state.jpg
+                    if jpg is not None and jpg is not last:
+                        last = jpg
                         self.wfile.write(b"--f\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n" % len(jpg)
-                                         + jpg.tobytes() + b"\r\n")
+                                         + jpg + b"\r\n")
                     time.sleep(1 / 15)
             except (ConnectionError, OSError):
                 pass  # page closed
@@ -146,6 +141,8 @@ def start(a, state, port):
                     for k, v in json.loads(self.body()).items():
                         apply(a, k, v)
                 elif self.path == "/bg":
+                    import cv2  # only here: numpy/OpenBLAS alone commit ~360 MB in the idle daemon
+                    import numpy as np
                     data = self.body()
                     img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
                     if img is None:

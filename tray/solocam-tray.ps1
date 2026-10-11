@@ -1,11 +1,11 @@
 ﻿<#
   solocam-tray.ps1 - tray panel for solocam (WPF), same look as the AW3821DW panel.
   Talks to the running solocam over its local settings API (http://127.0.0.1:8765, ui.py):
-  background, framing, cut-out sliders, live preview, re-lock, start/stop.
+  background, framing, cut-out sliders, live preview, re-lock, start/stop, exit (solocam + panel).
 #>
 param([switch]$Show)
 
-$SC_VERSION = '0.5.0'
+$SC_VERSION = '0.6.0'
 $Api  = 'http://127.0.0.1:8765'
 $Root = Split-Path -Parent $PSScriptRoot
 
@@ -186,6 +186,8 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
           <Slider x:Name="Sld_hold" Style="{StaticResource Slim}" Minimum="0" Maximum="5" SmallChange="0.1" LargeChange="0.5"/>
 
           <Button x:Name="BtnReset" Content="Сбросить к стандартным" Margin="0,16,0,0"/>
+          <Button x:Name="BtnExit" Content="Выключить solocam и выйти" Margin="0,8,0,0"
+                  ToolTip="Остановить фильтр и закрыть панель; камера solocam пропадёт до следующего входа в Windows"/>
           <TextBlock x:Name="LblErr" Style="{StaticResource Note}" Foreground="#FF7A7A" Margin="2,8,0,4"/>
         </StackPanel>
       </ScrollViewer>
@@ -364,6 +366,7 @@ function Show-Status {
 })
 (N 'BtnReset').Add_Click({ if (Api-Post '/settings' $Defaults) { Sync-All } })
 (N 'BtnRelock').Add_Click({ [void](Api-Post '/relock' @{}) })
+(N 'BtnExit').Add_Click({ Exit-All })
 
 # --- preview: poll one frame at a time; each request keeps solocam's pipeline up for 3 s ---
 $script:pvTimer = New-Object Windows.Threading.DispatcherTimer
@@ -420,8 +423,14 @@ function Show-Panel {
 }
 function Hide-Panel { $script:hiddenAt = Get-Date; Stop-Preview; $win.Hide() }
 
-function Invoke-Autostart([string]$cmd) {
-    Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$Root\autostart.ps1`"", $cmd
+function Invoke-Autostart([string]$cmd, [switch]$Wait) {
+    Start-Process powershell -WindowStyle Hidden -Wait:$Wait -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$Root\autostart.ps1`"", $cmd
+}
+function Exit-All {
+    # the panel is only a remote for solocam: "exit" means both, else solocam stays in memory unseen
+    $ni.Visible = $false; $win.Hide()
+    Invoke-Autostart 'stop' -Wait
+    $win.Close(); [Windows.Application]::Current.Shutdown()
 }
 
 $ni.Add_MouseClick({
@@ -438,7 +447,7 @@ $menu = New-Object Windows.Forms.ContextMenuStrip
 $miStart = $menu.Items.Add('Запустить solocam', $null, { Invoke-Autostart 'start' })
 $miStop  = $menu.Items.Add('Остановить solocam', $null, { Invoke-Autostart 'stop' })
 [void]$menu.Items.Add('-')
-[void]$menu.Items.Add('Выход из панели', $null, { $ni.Visible = $false; $win.Close(); [Windows.Application]::Current.Shutdown() })
+[void]$menu.Items.Add('Выход (выключить solocam)', $null, { Exit-All })
 $menu.Add_Opening({ $up = [bool]$script:st; $miStart.Enabled = -not $up; $miStop.Enabled = $up })
 $ni.ContextMenuStrip = $menu
 

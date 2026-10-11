@@ -16,20 +16,15 @@ run only while some app streams from it.
 """
 import argparse
 import gc
+import glob
+import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
 import time
 import types
-
-import numpy as np
-import torch
-import torch.nn.functional as F
-from ultralytics import YOLO
-
-import glob
-import shutil
 
 if sys.stdout is None:  # pythonw (autostart task): keep a log instead of a console
     sys.stdout = sys.stderr = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "solocam.log"), "a", buffering=1)
@@ -59,15 +54,26 @@ ap.add_argument("--no-vcam", action="store_true")
 ap.add_argument("--out", help="also write the result to this video file")
 ap.add_argument("--frames", type=int, default=0, help="stop after N frames (tests)")
 ap.add_argument("--ui", type=int, default=8765, help="settings page port on 127.0.0.1, 0 = off")
+ap.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)  # internal: the pipeline child, see Worker
 a = ap.parse_args()
 if not a.no_vcam:  # settings saved from the settings page win over the defaults above
     import ui
     ui.load(a)
 W, H = map(int, a.size.split("x"))
-dev = torch.device("cuda")
+# The camera daemon (vcam + settings page) never imports torch: torch, CUDA and the models commit
+# ~2.6 GB of host memory that stays after the first use, so they live in a child process that
+# runs only while someone watches (Worker). --preview / --no-vcam run the pipeline in-process.
+PIPELINE_HERE = a.worker or a.preview or a.no_vcam
+if PIPELINE_HERE:
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+    from ultralytics import YOLO
+    dev = torch.device("cuda")
 # shared with the settings page (ui.py)
-# preview_until: the settings page / tray panel keeps it in the future while it shows the preview
-state = types.SimpleNamespace(status="idle", fps=0.0, det=None, frame=None, preview_until=0.0)
+# preview_until: the settings page / tray panel keeps it in the future while it shows the preview;
+# jpg: the latest preview frame, made only while preview_until is in the future
+state = types.SimpleNamespace(status="idle", fps=0.0, det=None, jpg=None, preview_until=0.0, grab=None)
 
 
 class Grabber:
@@ -278,7 +284,11 @@ class Matter:
     (~14 ms per frame on this box), the graph runs the same net in ~6 ms."""
 
     def __init__(self):
-        rvm = torch.hub.load("PeterL1n/RobustVideoMatting", "mobilenetv3", trust_repo=True, verbose=False)
+        repo = os.path.join(torch.hub.get_dir(), "PeterL1n_RobustVideoMatting_master")
+        if os.path.isdir(repo):  # cached: skip the GitHub check, 2 s per wake (30+ s on a bad link)
+            rvm = torch.hub.load(repo, "mobilenetv3", source="local")
+        else:
+            rvm = torch.hub.load("PeterL1n/RobustVideoMatting", "mobilenetv3", trust_repo=True, verbose=False)
         rvm = rvm.to(dev).eval()
         # its encoder builds mean/std tensors from lists every call, which graph capture forbids
         mean = torch.tensor([0.485, 0.456, 0.406], device=dev).view(1, 3, 1, 1)
@@ -306,40 +316,144 @@ class Matter:
         return self.out[1]
 
 
+class Worker:
+    """The pipeline in a child process (solocam.py --worker). It is started when someone watches and
+    stays LINGER s after the last viewer (webcam closed, models out of VRAM, like before), so apps that
+    reopen the camera get a picture in ~2 s; then it exits and Windows gets all torch/CUDA memory back.
+    A fresh worker needs ~8-12 s to the first frame (python + torch + torchvision imports ~5 s of that).
+    Parent -> child stdin: JSON lines with live settings, active, preview_until, relock; EOF = exit.
+    Child -> parent stdout: JSON status lines, each optionally followed by `jpg` bytes of preview."""
+
+    def __init__(self):
+        state.status, state.jpg, self.t0 = "starting", None, time.time()
+        state.det = self.det = types.SimpleNamespace(target_id=None, relock=False)  # what ui.py reads and pokes
+        self.p = subprocess.Popen([sys.executable, os.path.abspath(__file__), *sys.argv[1:], "--worker"],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr,
+                                  creationflags=subprocess.CREATE_NO_WINDOW)
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        for line in self.p.stdout:
+            msg = json.loads(line)
+            if msg.get("jpg"):
+                state.jpg = self.p.stdout.read(msg["jpg"])
+            if self.t0 and msg["status"] == "active":
+                print(f"worker up in {time.time() - self.t0:.1f} s")
+                self.t0 = None
+            state.status, state.fps, self.det.target_id = msg["status"], msg["fps"], msg["target"]
+
+    def tell(self, active):
+        msg = {k: getattr(a, k) for k in ["bg", *ui.LIVE]}
+        msg.update(active=active, preview_until=state.preview_until, relock=state.det.relock)
+        state.det.relock = False
+        try:
+            self.p.stdin.write(json.dumps(msg).encode() + b"\n")
+            self.p.stdin.flush()
+        except OSError:
+            pass  # child gone; serve() sees it
+
+    def stop(self):
+        try:
+            self.p.stdin.close()  # the child kills its ffmpeg and exits
+            self.p.wait(10)
+        except (OSError, subprocess.TimeoutExpired):
+            self.p.kill()
+        state.status, state.fps, state.det, state.jpg = "idle", 0.0, None, None
+
+
+LINGER = 120  # s the worker outlives the last viewer: a call app opening the camera twice waits once
+
+
+def serve(cam):
+    """Camera daemon: keeps a worker while the camera is watched and LINGER s after."""
+    watched = lambda: cam.active.is_set() or time.time() < state.preview_until
+    w, seen, backoff = None, 0.0, 1
+    while True:
+        if watched():
+            seen = time.time()
+            if w is None:
+                print("watched", time.strftime("%X"))
+                w, started = Worker(), time.time()
+        elif w and time.time() - seen > LINGER:
+            print("idle, worker stopped", time.strftime("%X"))
+            w.stop()
+            w = None
+        if w and w.p.poll() is not None:  # crashed (e.g. CUDA error): restart, but not in a tight loop
+            print(f"worker exited with {w.p.returncode}, restarting in {backoff} s")
+            w.stop()
+            w = None
+            time.sleep(backoff)
+            backoff = 1 if time.time() - started > 60 else min(backoff * 2, 30)
+        if w:
+            w.tell(cam.active.is_set())
+        time.sleep(0.25)
+
+
+def worker_io(cam):
+    """In the child: apply what the parent sends, report status and preview frames back."""
+    out = sys.stdout.buffer
+    sys.stdout = sys.stderr  # prints go to the log, stdout carries only messages
+
+    def read():
+        for line in sys.stdin.buffer:
+            for k, v in json.loads(line).items():
+                if k == "active":  # the parent's camera monitor; main() waits on it as on its own
+                    (cam.active.set if v else cam.active.clear)()
+                elif k == "preview_until":
+                    state.preview_until = v
+                elif k == "relock":
+                    if v and state.det:
+                        state.det.relock = True
+                else:
+                    ui.apply(a, k, v)
+        if state.grab:  # parent closed stdin or died: free the webcam and leave at once
+            state.grab.p.kill()
+        os._exit(0)
+
+    def report():
+        last = None
+        while True:
+            cur = state.jpg
+            jpg, last = (cur if cur is not last else None), cur
+            det = state.det
+            msg = {"status": state.status, "fps": state.fps, "jpg": len(jpg) if jpg else 0,
+                   "target": det.target_id if det else None}
+            out.write(json.dumps(msg).encode() + b"\n" + (jpg or b""))
+            out.flush()
+            time.sleep(1 / 15)
+
+    threading.Thread(target=read, daemon=True).start()
+    threading.Thread(target=report, daemon=True).start()
+
+
 def main():
     cam = None
-    if not a.no_vcam:
+    if a.worker:
+        import vcam
+        cam = vcam.VirtualCamera(W, H, a.fps, register=False)  # the parent owns the camera
+        worker_io(cam)
+    elif not a.no_vcam:
         import vcam
         cam = vcam.VirtualCamera(W, H, a.fps)
         print("virtual camera: solocam")
         if a.ui:
             import ui
             ui.start(a, state, a.ui)
+        if not a.preview:
+            return serve(cam)
     writer = None
     if a.out:
         writer = subprocess.Popen([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo",
                                    "-pix_fmt", "rgb24", "-s", a.size, "-r", str(a.fps), "-i", "-",
                                    "-pix_fmt", "yuv420p", a.out], stdin=subprocess.PIPE)
-    if a.preview:
-        import cv2
+    import cv2
 
-    # With the virtual camera the webcam is open and the nets are in VRAM only while some app
-    # streams from "solocam" (Windows reports it, see vcam.Monitor) or the settings page shows
-    # its preview. --preview and tests run all the time.
+    # In-process pipeline: the worker child (see Worker), --preview and tests.
+    # The webcam is open and the nets are in VRAM only while watched.
     watched = lambda: a.preview or not cam or cam.active.is_set() or time.time() < state.preview_until
-    if cam and not watched():
-        # warm up once: the first model load in a process (CUDA/cuDNN init, kernels, file cache)
-        # takes ~10 s, later ones ~3 s; pay it at startup, not on the first call
-        det, matte = Detector(), Matter()
-        det.push(np.zeros((H, W, 3), np.uint8))
-        with torch.inference_mode():
-            matte(torch.zeros(1, 3, H, W, device=dev))
-        time.sleep(1)
-        det.close()
-        del det, matte
-        gc.collect()
-        torch.cuda.empty_cache()
     alpha_ch = torch.ones(1, 1, H, W, device=dev)
+    to_bgra = lambda img: (torch.cat([img[:, [2, 1, 0]], alpha_ch], 1)[0].permute(1, 2, 0) * 255
+                           ).clamp(0, 255).byte().contiguous().cpu().numpy()
     n, t0, backoff, quit_ = 0, time.time(), 1, False
     while not quit_:
         if not watched():
@@ -348,8 +462,8 @@ def main():
             while not watched():
                 time.sleep(0.25)  # two in-process flags; the waits for Windows are in vcam.Monitor
             print("watched", time.strftime("%X"))
-        state.status = "starting"
-        grab = Grabber()  # the webcam opens while the nets load
+        state.status, t_wake = "starting", time.time()
+        grab = state.grab = Grabber()  # the webcam opens while the nets load
         det, matte = Detector(), Matter()
         state.det, bg_key, bg_static, framer = det, None, None, Framer()
         state.status = "active"
@@ -377,11 +491,10 @@ def main():
                 bg = bg_static
                 out = framer(src * alpha + bg * (1 - alpha), det.box, det.line)
                 if cam:
-                    bgra = torch.cat([out[:, [2, 1, 0]], alpha_ch], 1)
-                    bgra = (bgra[0].permute(1, 2, 0) * 255).clamp(0, 255).byte().contiguous().cpu().numpy()
+                    bgra = to_bgra(out)
                     cam.send(bgra)
                     if time.time() < state.preview_until:
-                        state.frame = bgra
+                        state.jpg = cv2.imencode(".jpg", bgra[..., :3], [cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes()
                 frame = (out[0].permute(1, 2, 0) * 255).clamp(0, 255).byte().cpu().numpy() if writer or a.preview else None
 
             if writer:
@@ -399,6 +512,8 @@ def main():
                     break
                 if k == ord("r"):
                     det.relock = True
+            if n == 0:
+                print(f"first frame in {time.time() - t_wake:.1f} s")
             n += 1
             backoff = 1
             if n % 150 == 0:
@@ -408,9 +523,12 @@ def main():
                 quit_ = True
                 break
         grab.p.kill()
+        if cam and bg_static is not None:  # the camera keeps showing the last frame: leave the background, not you
+            with torch.inference_mode():
+                cam.send(to_bgra(bg_static))
         # give the VRAM back while idle (the CUDA context itself stays, ~0.3 GB)
         det.close()
-        state.det = state.frame = None
+        state.det = state.jpg = None
         del det, matte, bg_static, bg, src, pha, gate, alpha, out
         gc.collect()
         torch.cuda.empty_cache()

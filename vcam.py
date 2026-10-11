@@ -122,11 +122,13 @@ class Monitor:
 class VirtualCamera:
     """send(rgb HxWx3 uint8 numpy or bytes of BGRA) into the camera; `active` = someone watches."""
 
-    def __init__(self, w, h, fps, name="solocam"):
+    def __init__(self, w, h, fps, name="solocam", register=True):
         self.w, self.h, self.slot_size = w, h, w * h * 4
         self.section_name = f"Global\\vvvv-vcam0-v2-{w}x{h}"
-        self.view = self.handle = None
+        self.view = self.handle = self.cam = None
         self.active = threading.Event()
+        if not register:  # writer only (a worker process): camera, header and heartbeat stay with the owner
+            return
 
         ole32.CoInitializeEx(None, 0)  # MTA
         mfplat.MFStartup(0x00020070, 0)
