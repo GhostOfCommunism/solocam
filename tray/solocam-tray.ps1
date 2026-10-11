@@ -5,7 +5,7 @@
 #>
 param([switch]$Show)
 
-$SC_VERSION = '0.6.0'
+$SC_VERSION = '0.7.0'
 $Api  = 'http://127.0.0.1:8765'
 $Root = Split-Path -Parent $PSScriptRoot
 
@@ -130,6 +130,8 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
                      VerticalAlignment="Center" HorizontalAlignment="Right"/>
         </DockPanel>
         <TextBlock x:Name="LblStatus" Foreground="{StaticResource Dim}" FontSize="12" Margin="0,2,0,8"/>
+        <Button x:Name="BtnPrepare" Content="Подготовить к звонку" Margin="0,0,0,8"
+                ToolTip="Включить веб-камеру и фильтр заранее, чтобы приложение для звонка сразу получило готовую картинку. Веб-камера занята, пока solocam готов. Держится 10 минут, повторное нажатие продлевает"/>
         <Border Height="214" CornerRadius="8" Background="#0C0E11">
           <Grid>
             <Image x:Name="ImgPv" Stretch="Uniform"/>
@@ -328,10 +330,14 @@ function Show-Status {
         switch ($st.status) {
             'active'   { $txt = "работает · $($st.fps) кадров/с · " + $(if ($st.locked) { 'вы в кадре' } else { 'никого не держит' }); $color = 'Green' }
             'starting' { $txt = 'запуск…'; $color = 'Orange' }
+            'ready'    { $txt = 'камера включена, готово · ещё ' + [TimeSpan]::FromSeconds($st.prepare_left).ToString('m\:ss') + $(if ($st.locked) { ' · вы в кадре' } else { ' · вас не видно' }); $color = 'DeepSkyBlue' }
             default    { $txt = 'простой: камеру никто не смотрит'; $color = 'Gray' }
         }
     }
+    if ($st -and $st.prepare_left -gt 0 -and $st.status -in 'idle', 'starting') { $txt = 'включаю камеру и фильтр…'; $color = 'Orange' }  # worker still starting
     (N 'LblStatus').Text = $txt
+    (N 'BtnPrepare').Content = $(if ($st.status -eq 'ready') { 'Продлить готовность (10 мин)' } else { 'Подготовить к звонку' })
+    (N 'BtnPrepare').IsEnabled = [bool]$st -and $st.status -notin 'active', 'starting'
     $script:ni.Text = ("solocam — $txt").Substring(0, [Math]::Min(63, ("solocam — $txt").Length))
     if ($script:iconColor -ne $color) { $script:iconColor = $color; $script:ni.Icon = New-TrayIcon $color }
 }
@@ -367,6 +373,8 @@ function Show-Status {
 (N 'BtnReset').Add_Click({ if (Api-Post '/settings' $Defaults) { Sync-All } })
 (N 'BtnRelock').Add_Click({ [void](Api-Post '/relock' @{}) })
 (N 'BtnExit').Add_Click({ Exit-All })
+function Invoke-Prepare { if (Api-Post '/prepare' @{}) { $script:st = Api-State; Show-Status } }
+(N 'BtnPrepare').Add_Click({ Invoke-Prepare })
 
 # --- preview: poll one frame at a time; each request keeps solocam's pipeline up for 3 s ---
 $script:pvTimer = New-Object Windows.Threading.DispatcherTimer
@@ -443,6 +451,7 @@ $ni.Add_MouseClick({
 $menu = New-Object Windows.Forms.ContextMenuStrip
 [void]$menu.Items.Add('Открыть', $null, { Show-Panel })
 [void]$menu.Items.Add('Открыть в браузере', $null, { Start-Process $Api })
+[void]$menu.Items.Add('Подготовить к звонку', $null, { Invoke-Prepare })
 [void]$menu.Items.Add('-')
 $miStart = $menu.Items.Add('Запустить solocam', $null, { Invoke-Autostart 'start' })
 $miStop  = $menu.Items.Add('Остановить solocam', $null, { Invoke-Autostart 'stop' })

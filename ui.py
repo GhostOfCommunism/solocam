@@ -12,6 +12,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+PREPARE = 600  # s "prepare for call" keeps the pipeline running if no call starts; pressing again extends
 HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS = os.path.join(HERE, "settings.json")
 BG_DIR = os.path.join(HERE, "bg")
@@ -92,7 +93,10 @@ def start(a, state, port):
                     self.reply(f.read(), "text/html; charset=utf-8")
             elif path == "/state":
                 self.reply({"settings": {k: getattr(a, k) for k in ["bg", *LIVE]},
-                            "status": state.status, "fps": state.fps,
+                            # ready = prepared for a call: webcam and nets running, no app watching yet
+                            "status": "ready" if state.status == "active" and state.prepare_until > time.time()
+                            and not state.cam_active() else state.status, "fps": state.fps,
+                            "prepare_left": max(0, round(state.prepare_until - time.time())),
                             "locked": state.det is not None and state.det.target_id is not None,
                             "backgrounds": sorted(os.listdir(BG_DIR)) if os.path.isdir(BG_DIR) else []})
             elif path == "/bgfile":
@@ -161,6 +165,9 @@ def start(a, state, port):
                 elif self.path == "/relock":
                     if state.det is not None:
                         state.det.relock = True
+                elif self.path == "/prepare":  # start the pipeline now, so a call gets a live picture at once
+                    state.prepare_until = time.time() + PREPARE
+                    return self.reply({"ok": True})
                 else:
                     return self.reply({"error": "not found"}, code=404)
                 save(a)

@@ -73,7 +73,9 @@ if PIPELINE_HERE:
 # shared with the settings page (ui.py)
 # preview_until: the settings page / tray panel keeps it in the future while it shows the preview;
 # jpg: the latest preview frame, made only while preview_until is in the future
-state = types.SimpleNamespace(status="idle", fps=0.0, det=None, jpg=None, preview_until=0.0, grab=None)
+# prepare_until: "prepare for call" pressed: run the pipeline without a viewer until then (see ui.PREPARE)
+state = types.SimpleNamespace(status="idle", fps=0.0, det=None, jpg=None, preview_until=0.0, grab=None,
+                              prepare_until=0.0, cam_active=lambda: False)
 
 
 class Grabber:
@@ -344,7 +346,8 @@ class Worker:
 
     def tell(self, active):
         msg = {k: getattr(a, k) for k in ["bg", *ui.LIVE]}
-        msg.update(active=active, preview_until=state.preview_until, relock=state.det.relock)
+        msg.update(active=active, preview_until=state.preview_until, prepare_until=state.prepare_until,
+                   relock=state.det.relock)
         state.det.relock = False
         try:
             self.p.stdin.write(json.dumps(msg).encode() + b"\n")
@@ -369,10 +372,12 @@ def serve(cam):
     watched = lambda: cam.active.is_set() or time.time() < state.preview_until
     w, seen, backoff = None, 0.0, 1
     while True:
-        if watched():
-            seen = time.time()
+        if cam.active.is_set():
+            state.prepare_until = 0.0  # the call started: after it, the usual LINGER
+        if watched() or time.time() < state.prepare_until:
+            seen = time.time() if watched() else seen
             if w is None:
-                print("watched", time.strftime("%X"))
+                print("watched" if watched() else "preparing for a call", time.strftime("%X"))
                 w, started = Worker(), time.time()
         elif w and time.time() - seen > LINGER:
             print("idle, worker stopped", time.strftime("%X"))
@@ -399,8 +404,8 @@ def worker_io(cam):
             for k, v in json.loads(line).items():
                 if k == "active":  # the parent's camera monitor; main() waits on it as on its own
                     (cam.active.set if v else cam.active.clear)()
-                elif k == "preview_until":
-                    state.preview_until = v
+                elif k in ("preview_until", "prepare_until"):
+                    setattr(state, k, v)
                 elif k == "relock":
                     if v and state.det:
                         state.det.relock = True
@@ -435,6 +440,7 @@ def main():
     elif not a.no_vcam:
         import vcam
         cam = vcam.VirtualCamera(W, H, a.fps)
+        state.cam_active = cam.active.is_set
         print("virtual camera: solocam")
         if a.ui:
             import ui
@@ -450,7 +456,9 @@ def main():
 
     # In-process pipeline: the worker child (see Worker), --preview and tests.
     # The webcam is open and the nets are in VRAM only while watched.
-    watched = lambda: a.preview or not cam or cam.active.is_set() or time.time() < state.preview_until
+    # prepare_until: "prepare for call" runs the whole pipeline (webcam on, person locked) before any viewer
+    watched = lambda: (a.preview or not cam or cam.active.is_set()
+                       or time.time() < max(state.preview_until, state.prepare_until))
     alpha_ch = torch.ones(1, 1, H, W, device=dev)
     to_bgra = lambda img: (torch.cat([img[:, [2, 1, 0]], alpha_ch], 1)[0].permute(1, 2, 0) * 255
                            ).clamp(0, 255).byte().contiguous().cpu().numpy()
@@ -460,7 +468,7 @@ def main():
             state.status = "idle"
             print("idle", time.strftime("%X"))
             while not watched():
-                time.sleep(0.25)  # two in-process flags; the waits for Windows are in vcam.Monitor
+                time.sleep(0.25)  # in-process flags; the waits for Windows are in vcam.Monitor
             print("watched", time.strftime("%X"))
         state.status, t_wake = "starting", time.time()
         grab = state.grab = Grabber()  # the webcam opens while the nets load
